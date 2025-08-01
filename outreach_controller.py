@@ -56,7 +56,16 @@ STATE_FILE = "./logs/processing_state.json"
 LOG_FILE = "./logs/outreach.log"
 PID_FILE = "./logs/daemon.pid"
 SETUP_MARKER = "./.setup_complete"
-DEPENDENCIES = ["openai", "pandas", "google-genai", "google-api-core", "python-dotenv", "groq"]
+DEPENDENCIES = ["openai",
+                "pandas",
+                "google-generativeai",
+                "google-api-core", 
+                "python-dotenv",
+                "groq",    
+                "requests",  # Added for HeyGen API
+                "aiohttp",   # Added for async operations
+                "asyncio"    # Added for async processing
+    ]
 GENERATOR_DAEMON_FPATH = "outreach_daemon.py"
 
 class OutreachManager:
@@ -68,6 +77,10 @@ class OutreachManager:
             self.python_path = self.venv_path / "Scripts" / "python.exe"
         else:  # macOS, Linux
             self.python_path = self.venv_path / "bin" / "python"
+    
+    def is_setup_complete(self):
+        """Check if setup has been completed"""
+        return Path(SETUP_MARKER).exists()        
 
     def check_python_version(self):
         """Check Python version"""
@@ -244,92 +257,46 @@ class OutreachManager:
         return api_keys
 
     def start(self, resume=False, test_mode=False, test_run_count=3):
-        """Start the daemon - cross-platform"""
-        # Check if already running
-        pid = self.is_running()
-        if pid:
-            print(f"⚠️  Outreach generator already running (PID: {pid})")
-            if platform.system() != "Windows":
-                print("   📋 Monitor: tail -f logs/outreach.log")
-            else:
-                print("   📋 Monitor: Get-Content logs/outreach.log -Wait")
-            print("   🛑 Stop: python outreach_controller.py stop")
+        """Start the outreach generator"""
+        if not self.is_setup_complete():
+            print("❌ Setup not completed. Run setup first:")
+            print("   python outreach_controller.py --setup")
             return
 
-        # Run setup if needed
-        if not Path(SETUP_MARKER).exists():
-            api_keys = self.setup()
-        else:
-            # Load API keys from .env file
-            load_dotenv()
-            
-            # Check for at least one API key
-            api_key = (os.getenv('OPENAI_API_KEY') or 
-                      os.getenv('GEMINI_API_KEY') or 
-                      os.getenv('GROQ_API_KEY') or 
-                      os.getenv('OPENROUTER_API_KEY'))
-            
-            if not api_key:
-                print("❌ No API keys found in .env file")
-                print("   Run setup again: python outreach_controller.py --setup")
-                sys.exit(1)
-
-        # Clean if not resuming
-        if not resume:
-            self.clean()
-
         print("🚀 Starting Grant Outreach Generator...")
-
-        # Load environment variables from .env
-        load_dotenv()
-        env = os.environ.copy()
-
+        
+        # Clean logs and outputs before starting
+        self.clean()
+        
         try:
-            if test_mode:
-                # Import and run the daemon directly in test mode
-                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-                import outreach_daemon
-
-                controller = outreach_daemon.DaemonController()
+            # Set environment variables for the daemon
+            env = os.environ.copy()
+            env['PYTHONPATH'] = str(Path(__file__).parent)
+            
+            if platform.system() == "Windows":
+                # On Windows, run in foreground
+                print("🚀 Running on Windows")
+                from outreach_daemon import DaemonController
+                controller = DaemonController()
                 controller.initialize()
-                controller.test_run(run_count=test_run_count)
-                return
-            else:
-                if platform.system() == "Windows":
-                    # On Windows, run in foreground with proper signal handling
-                    print("✅ Starting in foreground mode (Windows)")
-                    
-                    # Run daemon directly (not subprocess)
-                    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-                    import outreach_daemon
-                    
-                    controller = outreach_daemon.DaemonController()
-                    controller.initialize()
-                    
-                    # Write PID file
-                    with open(PID_FILE, 'w') as f:
-                        f.write(str(os.getpid()))
-                    
-                    print(f"✅ Started daemon (PID: {os.getpid()})")
-                    print("📋 Press Ctrl+C to stop")
-                    
-                    # Run the daemon loop
-                    controller.run_daemon_loop()
-                    
+                
+                if test_mode:
+                    # FIXED: Call test_run method
+                    controller.test_run(run_count=test_run_count)
                 else:
-                    # On Unix/macOS, use proper daemon forking
-                    result = subprocess.run([str(self.python_path), GENERATOR_DAEMON_FPATH],
-                                          env=env, check=True)
-
-        except KeyboardInterrupt:
-            print("\n🛑 Stopping daemon...")
-            if os.path.exists(PID_FILE):
-                os.remove(PID_FILE)
-            print("✅ Daemon stopped")
+                    controller.run_daemon_loop()
+            else:
+                # On Unix/macOS, can fork to background
+                print("🚀 Starting daemon...")
+                result = subprocess.run([str(self.python_path), GENERATOR_DAEMON_FPATH],
+                                      env=env, check=True)
+            
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Error starting generator: {e}")
         except Exception as e:
             print(f"❌ Error starting generator: {e}")
+            import traceback
             traceback.print_exc()
-            sys.exit(1)
 
     def stop(self):
         """Stop the daemon - cross-platform"""
