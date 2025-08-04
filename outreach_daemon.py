@@ -9,6 +9,9 @@ import signal
 import json
 import glob
 import csv
+import asyncio
+import threading
+import aiohttp
 from datetime import datetime, timedelta
 from pathlib import Path
 import logging
@@ -376,6 +379,26 @@ class OutreachGenerator:
         def signal_handler(sig, frame):
             logging.info("🛑 Graceful shutdown requested")
             self.shutdown_requested = True
+            
+        # If we're in an event loop, stop it
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:
+            pass  # No loop running
+        
+        # Force exit after 5 seconds if graceful shutdown doesn't work
+        def force_exit():
+            time.sleep(5)
+            if self.shutdown_requested:  # Only force exit if we're still trying to shutdown
+                logging.warning("🚨 Force exiting after timeout...")
+                os._exit(1)
+        
+        threading.Thread(target=force_exit, daemon=True).start()    
+        
+    
+    
         
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
@@ -407,7 +430,7 @@ class OutreachGenerator:
         # About section (key for personalization)
         if person_data.get('about'):
             context_parts.append(f"\n=== ABOUT ===")
-            context_parts.append(person_data['about'][:500])  # Limit length
+            context_parts.append(person_data['about'])  # Limit length
         
         # Recent activity (very important for personalization)
         recent_posts = []
@@ -491,123 +514,205 @@ Write the email for {full_name} at {company}:"""
 
         return prompt
 
-async def generate_outreach(self, person_data: Dict) -> ProcessingResult:
-    """Generate complete outreach with initial email, follow-up, video script, and HeyGen video"""
-    try:
-        # Generate initial email
-        initial_result = await self._generate_email(person_data, "initial")
-        if initial_result.status != ProcessingStatus.SUCCESS:
-            return initial_result
-        
-        # Generate follow-up email
-        followup_result = await self._generate_email(person_data, "followup")
-        if followup_result.status != ProcessingStatus.SUCCESS:
-            # If follow-up fails, continue with just initial email
-            logging.warning("Follow-up email generation failed, continuing with initial only")
-            followup_result = ProcessingResult(
-                status=ProcessingStatus.SUCCESS,
-                data={"subject": "", "body": ""}
-            )
-        
-        # Generate video script
-        video_script_result = await self._generate_video_script(person_data, initial_result.data)
-        if video_script_result.status != ProcessingStatus.SUCCESS:
-            logging.warning("Video script generation failed, continuing without video")
-            video_script_result = ProcessingResult(
-                status=ProcessingStatus.SUCCESS,
-                data={"script": ""}
-            )
-        
-        # Generate HeyGen video (if we have a script)
-        video_url = ""
-        video_id = ""
-        if video_script_result.data.get('script'):
-            try:
-                heygen = HeyGenIntegration()
-                video_result = await heygen.generate_video(
-                    video_script_result.data['script'],
-                    person_data.get('firstName', 'Prospect')
+    async def generate_outreach(self, person_data: Dict) -> ProcessingResult:
+        """Generate complete outreach with initial email, follow-up, video script, and HeyGen video"""
+        try:
+            # Generate initial email
+            initial_result = await self._generate_email(person_data, "initial")
+            if initial_result.status != ProcessingStatus.SUCCESS:
+                # Fallback to basic email if enhanced fails
+                initial_result = await self._generate_basic_email(person_data)
+                if initial_result.status != ProcessingStatus.SUCCESS:
+                    return initial_result
+            
+            # Generate follow-up email
+            followup_result = await self._generate_email(person_data, "followup")
+            if followup_result.status != ProcessingStatus.SUCCESS:
+                # If follow-up fails, continue with just initial email
+                logging.warning("Follow-up email generation failed, continuing with initial only")
+                followup_result = ProcessingResult(
+                    status=ProcessingStatus.SUCCESS,
+                    data={"subject": "Follow-up: Partnership Opportunity", "body": "Hi there, Following up on my previous email..."}
                 )
-                video_url = video_result.get('video_url', '')
-                video_id = video_result.get('video_id', '')
+            
+            # Generate video script
+            video_script_result = await self._generate_video_script(person_data, initial_result.data)
+            if video_script_result.status != ProcessingStatus.SUCCESS:
+                logging.warning("Video script generation failed, continuing without video")
+                video_script_result = ProcessingResult(
+                    status=ProcessingStatus.SUCCESS,
+                    data={"script": f"Hi {person_data.get('firstName', 'there')}, I'm Grant from Sleft Payments..."}
+                )
+            
+            # Generate HeyGen video (if we have a script)
+            video_url = ""
+            video_id = ""
+            if video_script_result.data.get('script'):
+                try:
+                    heygen = HeyGenIntegration()
+                    video_result = await heygen.generate_video(
+                        video_script_result.data['script'],
+                        person_data.get('firstName', 'Prospect')
+                    )
+                    if video_result.get('success'):
+                        video_url = video_result.get('video_url', '')
+                        video_id = video_result.get('video_id', '')
+                    else:
+                        logging.warning(f"HeyGen video generation failed: {video_result.get('error', 'Unknown error')}")
+                except Exception as e:
+                    logging.warning(f"HeyGen video generation failed: {e}")
+            
+            # Get product recommendation
+            try:
+                product_rec = ProductIntelligence.select_best_product(person_data)
+            except:
+                product_rec = {'product_info': {'name': 'Payment Processing'}, 'confidence_score': 5}
+            
+            # Combine all results
+            complete_data = {
+                'subject': initial_result.data['subject'],  # Keep original format for compatibility
+                'body': initial_result.data['body'],
+                'initial_subject': initial_result.data['subject'],
+                'initial_body': initial_result.data['body'],
+                'followup_subject': followup_result.data.get('subject', ''),
+                'followup_body': followup_result.data.get('body', ''),
+                'video_script': video_script_result.data.get('script', ''),
+                'video_url': video_url,
+                'video_id': video_id,
+                'citations': initial_result.data.get('citations', []),
+                'provider': initial_result.data.get('provider', ''),
+                'recommended_product': product_rec.get('product_info', {}).get('name', ''),
+                'product_confidence': product_rec.get('confidence_score', 0)
+            }
+            
+            return ProcessingResult(
+                status=ProcessingStatus.SUCCESS,
+                data=complete_data
+            )
+            
+        except Exception as e:
+            logging.error(f"Enhanced outreach generation failed: {e}")
+            # Fallback to basic email generation
+            return await self._generate_basic_email(person_data)
+
+
+    async def _generate_basic_email(self, person_data: Dict) -> ProcessingResult:
+        """Fallback method for basic email generation"""
+        prompt = self._create_standardized_prompt(person_data)
+        
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                provider = self.llm_manager.get_next_available_provider()
+                logging.info(f"🤖 Using {provider['type'].value} ({provider['model']})")
+                
+                result = self._generate_with_provider(provider, prompt)
+                
+                if result.status == ProcessingStatus.SUCCESS:
+                    return result
+                elif result.status == ProcessingStatus.RATE_LIMITED:
+                    self.llm_manager.set_provider_rate_limit(provider['type'], result.retry_after)
+                    retry_count += 1
+                    continue
+                else:
+                    retry_count += 1
+                    continue
+                    
             except Exception as e:
-                logging.warning(f"HeyGen video generation failed: {e}")
-        
-        # Get product recommendation
-        product_rec = ProductIntelligence.select_best_product(person_data)
-        
-        # Combine all results
-        complete_data = {
-            'subject': initial_result.data['subject'],  # Keep original format for compatibility
-            'body': initial_result.data['body'],
-            'initial_subject': initial_result.data['subject'],
-            'initial_body': initial_result.data['body'],
-            'followup_subject': followup_result.data.get('subject', ''),
-            'followup_body': followup_result.data.get('body', ''),
-            'video_script': video_script_result.data.get('script', ''),
-            'video_url': video_url,
-            'video_id': video_id,
-            'citations': initial_result.data.get('citations', []),
-            'provider': initial_result.data.get('provider', ''),
-            'recommended_product': product_rec.get('product_info', {}).get('name', ''),
-            'product_confidence': product_rec.get('confidence_score', 0)
-        }
+                logging.error(f"❌ Provider error: {e}")
+                retry_count += 1
+                continue
         
         return ProcessingResult(
-            status=ProcessingStatus.SUCCESS,
-            data=complete_data
+            status=ProcessingStatus.ERROR,
+            error_message="All LLM providers failed or are rate limited"
         )
-        
-    except Exception as e:
-        logging.error(f"Enhanced outreach generation failed: {e}")
-        # Fallback to basic email generation
-        return await self._generate_basic_email(person_data)
 
-async def _generate_basic_email(self, person_data: Dict) -> ProcessingResult:
-    """Fallback method for basic email generation"""
-    prompt = self._create_standardized_prompt(person_data)
-    
-    max_retries = 3
-    retry_count = 0
-    
-    while retry_count < max_retries:
+    async def _generate_email(self, person_data: Dict, email_type: str) -> ProcessingResult:
+            """Generate personalized email (initial or follow-up)"""
+            prompt = self._create_enhanced_research_prompt(person_data, email_type)
+            
+            provider = self.llm_manager.get_next_available_provider()
+            
+            try:
+                if provider['type'] == LLMProvider.CLAUDE_SONNET:
+                    return await self._generate_with_claude(provider, prompt)
+                else:
+                    return self._generate_with_provider(provider, prompt)
+                    
+            except Exception as e:
+                return ProcessingResult(
+                    status=ProcessingStatus.ERROR,
+                    error_message=str(e)
+                )
+
+    async def _generate_with_claude(self, provider, prompt) -> ProcessingResult:
+        """Generate with Claude Sonnet via OpenRouter"""
+        try:
+            response = provider['client'].chat.completions.create(
+                extra_headers={
+                    "HTTP-Referer": os.getenv('SITE_URL', 'https://localhost'),
+                    "X-Title": os.getenv('SITE_NAME', 'Sleft Outreach Generator'),
+                },
+                model=provider['model'],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=1000
+            )
+            
+            full_text = response.choices[0].message.content
+            
+            ok, subject, body = self._parse_email_content(full_text)
+            if not ok:
+                return ProcessingResult(
+                    status=ProcessingStatus.ERROR,
+                    error_message=subject
+                )
+            
+            return ProcessingResult(
+                status=ProcessingStatus.SUCCESS,
+                data={
+                    "subject": subject,
+                    "body": body,
+                    "full_text": full_text,
+                    "citations": [],
+                    "provider": provider['type'].value
+                }
+            )
+            
+        except Exception as e:
+            if "rate_limit" in str(e).lower() or "429" in str(e):
+                retry_after = datetime.now() + timedelta(hours=1)
+                return ProcessingResult(
+                    status=ProcessingStatus.RATE_LIMITED,
+                    error_message=str(e),
+                    retry_after=retry_after
+                )
+            else:
+                return ProcessingResult(
+                    status=ProcessingStatus.ERROR,
+                    error_message=str(e)
+                )
+
+    async def _generate_video_script(self, person_data: Dict, email_data: Dict) -> ProcessingResult:
+        """Generate video script for HeyGen"""
+        prompt = self._create_video_script_prompt(person_data, email_data)
+        
         try:
             provider = self.llm_manager.get_next_available_provider()
-            logging.info(f"🤖 Using {provider['type'].value} ({provider['model']})")
-            
             result = self._generate_with_provider(provider, prompt)
             
             if result.status == ProcessingStatus.SUCCESS:
+                # Extract just the script content, not email format
+                script = result.data['body']  # Use body as script
+                return ProcessingResult(
+                    status=ProcessingStatus.SUCCESS,
+                    data={"script": script}
+                )
+            else:
                 return result
-            elif result.status == ProcessingStatus.RATE_LIMITED:
-                self.llm_manager.set_provider_rate_limit(provider['type'], result.retry_after)
-                retry_count += 1
-                continue
-            else:
-                retry_count += 1
-                continue
-                
-        except Exception as e:
-            logging.error(f"❌ Provider error: {e}")
-            retry_count += 1
-            continue
-    
-    return ProcessingResult(
-        status=ProcessingStatus.ERROR,
-        error_message="All LLM providers failed or are rate limited"
-    )
-
-    async def _generate_email(self, person_data: Dict, email_type: str) -> ProcessingResult:
-        """Generate personalized email (initial or follow-up)"""
-        prompt = self._create_enhanced_research_prompt(person_data, email_type)
-        
-        provider = self.llm_manager.get_next_available_provider()
-        
-        try:
-            if provider['type'] == LLMProvider.CLAUDE_SONNET:
-                return await self._generate_with_claude(provider, prompt)
-            else:
-                return self._generate_with_provider(provider, prompt)
                 
         except Exception as e:
             return ProcessingResult(
@@ -615,103 +720,31 @@ async def _generate_basic_email(self, person_data: Dict) -> ProcessingResult:
                 error_message=str(e)
             )
 
-async def _generate_with_claude(self, provider, prompt) -> ProcessingResult:
-    """Generate with Claude Sonnet via OpenRouter"""
-    try:
-        response = provider['client'].chat.completions.create(
-            extra_headers={
-                "HTTP-Referer": os.getenv('SITE_URL', 'https://localhost'),
-                "X-Title": os.getenv('SITE_NAME', 'Sleft Outreach Generator'),
-            },
-            model=provider['model'],
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=1000
-        )
+    def _create_video_script_prompt(self, person_data: Dict, email_data: Dict) -> str:
+        """Create prompt for video script generation"""
+        full_name = person_data.get('firstName', 'there')
+        company = person_data.get('companyName', 'your company')
         
-        full_text = response.choices[0].message.content
-        
-        ok, subject, body = self._parse_email_content(full_text)
-        if not ok:
-            return ProcessingResult(
-                status=ProcessingStatus.ERROR,
-                error_message=subject
-            )
-        
-        return ProcessingResult(
-            status=ProcessingStatus.SUCCESS,
-            data={
-                "subject": subject,
-                "body": body,
-                "full_text": full_text,
-                "citations": [],
-                "provider": provider['type'].value
-            }
-        )
-        
-    except Exception as e:
-        if "rate_limit" in str(e).lower() or "429" in str(e):
-            retry_after = datetime.now() + timedelta(hours=1)
-            return ProcessingResult(
-                status=ProcessingStatus.RATE_LIMITED,
-                error_message=str(e),
-                retry_after=retry_after
-            )
-        else:
-            return ProcessingResult(
-                status=ProcessingStatus.ERROR,
-                error_message=str(e)
-            )
+        prompt = f"""Create a 30-second personalized video script for HeyGen AI avatar.
 
-async def _generate_video_script(self, person_data: Dict, email_data: Dict) -> ProcessingResult:
-    """Generate video script for HeyGen"""
-    prompt = self._create_video_script_prompt(person_data, email_data)
-    
-    try:
-        provider = self.llm_manager.get_next_available_provider()
-        result = self._generate_with_provider(provider, prompt)
-        
-        if result.status == ProcessingStatus.SUCCESS:
-            # Extract just the script content, not email format
-            script = result.data['body']  # Use body as script
-            return ProcessingResult(
-                status=ProcessingStatus.SUCCESS,
-                data={"script": script}
-            )
-        else:
-            return result
-            
-    except Exception as e:
-        return ProcessingResult(
-            status=ProcessingStatus.ERROR,
-            error_message=str(e)
-        )
+    TARGET: {full_name} at {company}
+    EMAIL CONTEXT: {email_data.get('subject', '')} - {email_data.get('body', '')[:100]}
 
-def _create_video_script_prompt(self, person_data: Dict, email_data: Dict) -> str:
-    """Create prompt for video script generation"""
-    full_name = person_data.get('firstName', 'there')
-    company = person_data.get('companyName', 'your company')
-    
-    prompt = f"""Create a 30-second personalized video script for HeyGen AI avatar.
+    REQUIREMENTS:
+    1. 30 seconds maximum (75-90 words)
+    2. Natural, conversational tone
+    3. Direct eye contact phrases
+    4. Match the email's value proposition
+    5. Strong opening hook
+    6. Clear call-to-action
 
-TARGET: {full_name} at {company}
-EMAIL CONTEXT: {email_data.get('subject', '')} - {email_data.get('body', '')[:100]}
+    Generate ONLY the script text (no "Subject:" line needed):
 
-REQUIREMENTS:
-1. 30 seconds maximum (75-90 words)
-2. Natural, conversational tone
-3. Direct eye contact phrases
-4. Match the email's value proposition
-5. Strong opening hook
-6. Clear call-to-action
+    Hi {full_name}, I'm Grant from Sleft Payments. I noticed [specific company insight about {company}]. We've helped similar companies in {person_data.get('companyIndustry', 'your industry')} [specific benefit]. I'd love to show you how we can [specific value]. Are you free for a quick 15-minute call this week?
 
-Generate ONLY the script text (no "Subject:" line needed):
+    Generate the personalized video script:"""
 
-Hi {full_name}, I'm Grant from Sleft Payments. I noticed [specific company insight about {company}]. We've helped similar companies in {person_data.get('companyIndustry', 'your industry')} [specific benefit]. I'd love to show you how we can [specific value]. Are you free for a quick 15-minute call this week?
-
-Generate the personalized video script:"""
-
-    return prompt
+        return prompt
 
     def _generate_with_provider(self, provider, prompt) -> ProcessingResult:
         """Generate content with a specific provider"""
@@ -880,18 +913,18 @@ Generate the personalized video script:"""
                 }
             )
         except Exception as e:
-         if "rate_limit" in str(e).lower() or "429" in str(e):
-            retry_after = datetime.now() + timedelta(hours=1)
-            return ProcessingResult(
-                status=ProcessingStatus.RATE_LIMITED,
-                error_message=str(e),
-                retry_after=retry_after
-            )
-         else:
-            return ProcessingResult(
-                status=ProcessingStatus.ERROR,
-                error_message=str(e)
-            )       
+                if "rate_limit" in str(e).lower() or "429" in str(e):
+                    retry_after = datetime.now() + timedelta(hours=1)
+                    return ProcessingResult(
+                        status=ProcessingStatus.RATE_LIMITED,
+                        error_message=str(e),
+                        retry_after=retry_after
+                    )
+                else:
+                    return ProcessingResult(
+                        status=ProcessingStatus.ERROR,
+                        error_message=str(e)
+                    )       
 
     def _create_outreach_prompt(self, person_data: Dict) -> str:
         """Create the prompt for OpenAI with all available information"""
@@ -1349,6 +1382,9 @@ Generate the {email_type} email for {full_name} at {company}."""
 
         return True, subject, body
 
+
+
+
 class CSVProcessor:
     # Essential fields that must be present
     ESSENTIAL_FIELDS = [
@@ -1367,48 +1403,93 @@ class CSVProcessor:
                 return False
         return True
 
-async def process_person(self, person_data: Dict, row_num: int, total_rows: int) -> ProcessingResult:
-    """Process a single person with enhanced features"""
-    full_name = f"{person_data.get('firstName', '')} {person_data.get('lastName', '')}".strip()
-    company = person_data.get('companyName', 'Unknown Company')
-    
-    logging.info(f"[{row_num + 1}/{total_rows}] Processing person")
-    logging.info(f"🚀 Processing: {full_name} at {company}")
-
-    # Check for shutdown before starting
-    if self.generator.shutdown_requested:
-        logging.info("🛑 Shutdown requested, stopping person processing")
-        return ProcessingResult(
-            status=ProcessingStatus.SHUTDOWN,
-            error_message="Shutdown requested"
-        )
-
-    try:
-        # Use enhanced outreach generation
-        result = await self.generator.generate_outreach(person_data)
+    def process_person(self, person_data: Dict, row_num: int, total_rows: int) -> ProcessingResult:
+        """Process a single person with enhanced features - SYNC wrapper for ASYNC method"""
         
-        if result.status == ProcessingStatus.SUCCESS:
-            logging.info(f"✅ Successfully generated complete outreach for {full_name}")
-            if result.data.get('video_url'):
-                logging.info(f"🎥 Generated video: {result.data['video_url']}")
-            return result
-        elif result.status == ProcessingStatus.RATE_LIMITED:
-            logging.warning(f"⏳ Rate limited while processing {full_name}")
-            return result
-        else:
-            logging.error(f"❌ Failed to generate outreach for {full_name}: {result.error_message}")
-            return result
-
-    except Exception as e:
-        logging.error(f"❌ Error processing {full_name}: {e}")
-        return ProcessingResult(
-            status=ProcessingStatus.ERROR,
-            error_message=str(e)
+        # Check for shutdown before starting async processing  
+        if self.generator.shutdown_requested:
+            return ProcessingResult(
+                status=ProcessingStatus.SHUTDOWN,
+                error_message="Shutdown requested"
         )
-    finally:
-        # Only sleep if not shutting down
-        if not self.generator.shutdown_requested:
-            time.sleep(self.processing_delay)
+        
+        # Create event loop if it doesn't exist
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        try:
+            # Run the async method with timeout and shutdown checking
+            return loop.run_until_complete(
+                asyncio.wait_for(
+                    self._process_person_async(person_data, row_num, total_rows),
+                    timeout=120  # 2 minute timeout per person
+                )
+            )
+        except asyncio.TimeoutError:
+            return ProcessingResult(
+                status=ProcessingStatus.ERROR,
+                error_message="Processing timeout"
+            )
+        except KeyboardInterrupt:
+            logging.info("🛑 Keyboard interrupt in process_person")
+            self.generator.shutdown_requested = True
+            return ProcessingResult(
+                status=ProcessingStatus.SHUTDOWN,
+                error_message="Keyboard interrupt"
+            )
+        except Exception as e:
+            return ProcessingResult(
+                status=ProcessingStatus.ERROR,
+                error_message=str(e)
+            )
+
+    async def _process_person_async(self, person_data: Dict, row_num: int, total_rows: int) -> ProcessingResult:
+        """Process a single person with enhanced features - ASYNC implementation"""
+        full_name = f"{person_data.get('firstName', '')} {person_data.get('lastName', '')}".strip()
+        company = person_data.get('companyName', 'Unknown Company')
+        
+        logging.info(f"[{row_num + 1}/{total_rows}] Processing person")
+        logging.info(f"🚀 Processing: {full_name} at {company}")
+
+        # Check for shutdown before starting
+        if self.generator.shutdown_requested:
+            logging.info("🛑 Shutdown requested, stopping person processing")
+            return ProcessingResult(
+                status=ProcessingStatus.SHUTDOWN,
+                error_message="Shutdown requested"
+            )
+
+        try:
+            # Use enhanced outreach generation
+            result = await self.generator.generate_outreach(person_data)
+            
+            if result.status == ProcessingStatus.SUCCESS:
+                logging.info(f"✅ Successfully generated complete outreach for {full_name}")
+                if result.data.get('video_url'):
+                    logging.info(f"🎥 Generated video: {result.data['video_url']}")
+                return result
+            elif result.status == ProcessingStatus.RATE_LIMITED:
+                logging.warning(f"⏳ Rate limited while processing {full_name}")
+                return result
+            else:
+                logging.error(f"❌ Failed to generate outreach for {full_name}: {result.error_message}")
+                return result
+
+        except Exception as e:
+            logging.error(f"❌ Error processing {full_name}: {e}")
+            return ProcessingResult(
+                status=ProcessingStatus.ERROR,
+                error_message=str(e)
+            )
+        finally:
+            # Only sleep if not shutting down
+            if not self.generator.shutdown_requested:
+                import time
+                time.sleep(self.processing_delay)
+
     def validate_email_content(self, email_subject: str, email_body: str) -> bool:
         """Validate that email content doesn't contain error messages, invalid content, or template placeholders"""
         # Combine subject and body for checking
@@ -1517,78 +1598,78 @@ async def process_person(self, person_data: Dict, row_num: int, total_rows: int)
             logging.error(f"✗ Error loading CSV {file_path}: {e}")
             return None, None
 
-def create_output_csv(self, input_file_path: str) -> str:
-    """Create enhanced output CSV file with all new fields"""
-    input_name = Path(input_file_path).stem
-    output_file = os.path.join(OUTPUTS_DIR, f"{input_name}_complete_outreach.csv")
+    def create_output_csv(self, input_file_path: str) -> str:
+        """Create enhanced output CSV file with all new fields"""
+        input_name = Path(input_file_path).stem
+        output_file = os.path.join(OUTPUTS_DIR, f"{input_name}_complete_outreach.csv")
 
-    # Enhanced output columns
-    output_columns = [
-        # Basic info
-        'firstName', 'lastName', 'email', 'linkedinUrl', 'companyName', 'jobTitle', 'companyIndustry',
-        
-        # Initial email
-        'initialEmailSubject', 'initialEmailBody',
-        
-        # Follow-up email  
-        'followupEmailSubject', 'followupEmailBody',
-        
-        # Video content
-        'videoScript', 'videoUrl', 'videoId',
-        
-        # AI Intelligence
-        'recommendedProduct', 'productConfidence', 'researchCitations',
-        
-        # Metadata
-        'llmProvider', 'generatedAt'
-    ]
+        # Enhanced output columns
+        output_columns = [
+            # Basic info
+            'firstName', 'lastName', 'email', 'linkedinUrl', 'companyName', 'jobTitle', 'companyIndustry',
+            
+            # Initial email
+            'initialEmailSubject', 'initialEmailBody',
+            
+            # Follow-up email  
+            'followupEmailSubject', 'followupEmailBody',
+            
+            # Video content
+            'videoScript', 'videoUrl', 'videoId',
+            
+            # AI Intelligence
+            'recommendedProduct', 'productConfidence', 'researchCitations',
+            
+            # Metadata
+            'llmProvider', 'generatedAt'
+        ]
 
-    # Create empty output file with headers if it doesn't exist
-    if not os.path.exists(output_file):
-        df_output = pd.DataFrame(columns=output_columns)
-        df_output.to_csv(output_file, index=False)
+        # Create empty output file with headers if it doesn't exist
+        if not os.path.exists(output_file):
+            df_output = pd.DataFrame(columns=output_columns)
+            df_output.to_csv(output_file, index=False)
 
-    return output_file
+        return output_file
 
-def append_to_output_csv(self, output_file: str, person_data: Dict, outreach_result: Dict):
-    """Append enhanced result to output CSV"""
-    row_data = {
-        # Basic info
-        'firstName': person_data.get('firstName', ''),
-        'lastName': person_data.get('lastName', ''),
-        'email': person_data.get('email', ''),
-        'linkedinUrl': person_data.get('linkedinUrl', ''),
-        'companyName': person_data.get('companyName', ''),
-        'jobTitle': person_data.get('jobTitle', ''),
-        'companyIndustry': person_data.get('companyIndustry', ''),
-        
-        # Initial email
-        'initialEmailSubject': outreach_result.get('initial_subject', outreach_result.get('subject', '')),
-        'initialEmailBody': outreach_result.get('initial_body', outreach_result.get('body', '')),
-        
-        # Follow-up email
-        'followupEmailSubject': outreach_result.get('followup_subject', ''),
-        'followupEmailBody': outreach_result.get('followup_body', ''),
-        
-        # Video content
-        'videoScript': outreach_result.get('video_script', ''),
-        'videoUrl': outreach_result.get('video_url', ''),
-        'videoId': outreach_result.get('video_id', ''),
-        
-        # AI Intelligence
-        'recommendedProduct': outreach_result.get('recommended_product', ''),
-        'productConfidence': f"{outreach_result.get('product_confidence', 0)}/10",
-        'researchCitations': ', '.join(outreach_result.get('citations', [])),
-        
-        # Metadata
-        'llmProvider': outreach_result.get('provider', ''),
-        'generatedAt': datetime.now().isoformat()
-    }
+    def append_to_output_csv(self, output_file: str, person_data: Dict, outreach_result: Dict):
+        """Append enhanced result to output CSV"""
+        row_data = {
+            # Basic info
+            'firstName': person_data.get('firstName', ''),
+            'lastName': person_data.get('lastName', ''),
+            'email': person_data.get('email', ''),
+            'linkedinUrl': person_data.get('linkedinUrl', ''),
+            'companyName': person_data.get('companyName', ''),
+            'jobTitle': person_data.get('jobTitle', ''),
+            'companyIndustry': person_data.get('companyIndustry', ''),
+            
+            # Initial email
+            'initialEmailSubject': outreach_result.get('initial_subject', outreach_result.get('subject', '')),
+            'initialEmailBody': outreach_result.get('initial_body', outreach_result.get('body', '')),
+            
+            # Follow-up email
+            'followupEmailSubject': outreach_result.get('followup_subject', ''),
+            'followupEmailBody': outreach_result.get('followup_body', ''),
+            
+            # Video content
+            'videoScript': outreach_result.get('video_script', ''),
+            'videoUrl': outreach_result.get('video_url', ''),
+            'videoId': outreach_result.get('video_id', ''),
+            
+            # AI Intelligence
+            'recommendedProduct': outreach_result.get('recommended_product', ''),
+            'productConfidence': f"{outreach_result.get('product_confidence', 0)}/10",
+            'researchCitations': ', '.join(outreach_result.get('citations', [])),
+            
+            # Metadata
+            'llmProvider': outreach_result.get('provider', ''),
+            'generatedAt': datetime.now().isoformat()
+        }
 
-    # Append to CSV
-    df_row = pd.DataFrame([row_data])
-    df_row.to_csv(output_file, mode='a', header=False, index=False)
-    
+        # Append to CSV
+        df_row = pd.DataFrame([row_data])
+        df_row.to_csv(output_file, mode='a', header=False, index=False)
+        
 class DaemonController:
     def __init__(self):
         self.state = ProcessingState(STATE_FILE)
@@ -1926,6 +2007,11 @@ class DaemonController:
             print(f"⚠️ CSV only has {len(df)} rows, processing all available")
             run_count = len(df)
         
+        
+        # CREATE OUTPUT CSV FILE - THIS WAS MISSING!
+        output_file = self.processor.create_output_csv(file_path)
+        print(f"📁 Output will be saved to: {output_file}")
+        
         print(f"🔄 Processing {run_count} people...")
         print("=" * 60)
         
@@ -1961,6 +2047,10 @@ class DaemonController:
                 
                 if result.data.get('citations'):
                     print(f"🔗 Citations: {len(result.data['citations'])} sources")
+                
+                            # SAVE TO CSV - THIS WAS MISSING!
+                self.processor.append_to_output_csv(output_file, person_data, result.data)
+                print(f"💾 Saved to CSV: {os.path.basename(output_file)}")    
                     
             elif result.status == ProcessingStatus.RATE_LIMITED:
                 print(f"⏳ Rate limited - stopping test")
@@ -2141,6 +2231,63 @@ class HeyGenIntegration:
         self.api_key = os.getenv('HEYGEN_API_KEY')
         self.base_url = "https://api.heygen.com/v2"
         
+    
+    async def get_available_avatars(self) -> Dict:
+        """Get list of available avatars"""
+        if not self.api_key:
+            return {'error': 'HeyGen API key not found'}
+        
+        headers = {
+            'Accept': 'application/json',
+            'X-Api-Key': self.api_key
+        }
+        
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.base_url}/v2/avatars",
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        logging.info(f"📋 Available avatars: {len(result.get('data', {}).get('avatars', []))}")
+                        return result
+                    else:
+                        error_text = await response.text()
+                        return {'error': f'Failed to get avatars: {error_text}'}
+        except Exception as e:
+            return {'error': f'Error getting avatars: {str(e)}'}
+
+    
+    async def get_available_voices(self) -> Dict:
+        """Get list of available voices"""
+        if not self.api_key:
+            return {'error': 'HeyGen API key not found'}
+        
+        headers = {
+            'Accept': 'application/json',
+            'X-Api-Key': self.api_key
+        }
+        
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.base_url}/v2/voices",
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        logging.info(f"🎤 Available voices: {len(result.get('data', {}).get('voices', []))}")
+                        return result
+                    else:
+                        error_text = await response.text()
+                        return {'error': f'Failed to get voices: {error_text}'}
+        except Exception as e:
+            return {'error': f'Error getting voices: {str(e)}'}
+
+        
     async def generate_video(self, script: str, person_name: str) -> Dict:
         """Generate video using HeyGen API"""
         if not self.api_key:
@@ -2156,13 +2303,14 @@ class HeyGenIntegration:
             'video_inputs': [{
                 'character': {
                     'type': 'avatar',
-                    'avatar_id': 'default_avatar',  # You can customize this
-                    'avatar_type': 'professional'
+                    'avatar_id': 'Lina_Dress_Sitting_Side_public',  # You can customize this
+                    'avatar_type': 'normal'
                 },
                 'voice': {
                     'type': 'text',
-                    'input_text': script,
-                    'voice_id': 'en_us_male_professional'  # Customize voice
+                    'input_text': script[:1500],  # Limit to 1500 characters as per doc
+                    'voice_id': '119caed25533477ba63822d5d1552d25',  # Customize voice
+                    'speed': 1.0
                 },
                 'background': {
                     'type': 'color',
@@ -2178,7 +2326,9 @@ class HeyGenIntegration:
         }
         
         try:
-            async with aiohttp.ClientSession() as session:
+            import aiohttp
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{self.base_url}/video/generate",
                     headers=headers,
@@ -2188,19 +2338,49 @@ class HeyGenIntegration:
                         result = await response.json()
                         video_id = result.get('data', {}).get('video_id')
                         
-                        # Poll for completion
-                        video_url = await self._poll_video_status(video_id)
-                        return {
-                            'success': True,
-                            'video_id': video_id,
-                            'video_url': video_url
-                        }
+                        if video_id:
+                            logging.info(f"🎬 Video generation started, ID: {video_id}")
+                            # Poll for completion
+                            video_url = await self._poll_video_status(video_id)
+                            return {
+                                'success': True,
+                                'video_id': video_id,
+                                'video_url': video_url
+                            }
+                        else:
+                            return {'error': f'No video_id returned: {result}'}    
                     else:
                         error_text = await response.text()
+                        logging.error(f"HeyGen API error: {error_text}")
                         return {'error': f'HeyGen API error: {error_text}'}
                         
         except Exception as e:
+            logging.error(f"HeyGen integration error: {e}")
             return {'error': f'HeyGen integration error: {str(e)}'}
+        
+    # Add this method to HeyGenIntegration class
+
+    # async def get_available_avatars(self) -> Dict:
+    #     """Get list of available avatars"""
+    #     if not self.api_key:
+    #         return {'error': 'HeyGen API key not found'}
+        
+    #     headers = {'X-API-Key': self.api_key}
+        
+    #     try:
+    #         import aiohttp
+    #         async with aiohttp.ClientSession() as session:
+    #             async with session.get(
+    #                 f"{self.base_url}/avatars",
+    #                 headers=headers
+    #             ) as response:
+    #                 if response.status == 200:
+    #                     return await response.json()
+    #                 else:
+    #                     error_text = await response.text()
+    #                     return {'error': f'Failed to get avatars: {error_text}'}
+    #     except Exception as e:
+    #         return {'error': f'Error getting avatars: {str(e)}'}    
     
     async def _poll_video_status(self, video_id: str, max_attempts: int = 30) -> str:
         """Poll video generation status"""
